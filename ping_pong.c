@@ -1,3 +1,4 @@
+// Alarm handler should just reset the alarm and then call a seperate scheduler function.  This decouples the scheduler from the alarm
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -8,9 +9,11 @@
 
 #define QUEUE_LEN 50
 typedef enum {false, true} bool;
+struct sigaction* sa;
 
 int ping();
 int pong();
+int pop();
 
 struct Thread {
     int (*func)();
@@ -46,8 +49,8 @@ struct Thread* popQueue(struct Queue* q) {
     } else {
         popReturn = q->arr[q->tail];
         q->tail = (q->tail + 1) % QUEUE_LEN;
-        printf("q->head = %d, q->tial = %d\n", q->head, q->tail);
-        printf("returning t: %p\n", popReturn);
+        //printf("q->head = %d, q->tial = %d\n", q->head, q->tail);
+        //printf("popped thread @ address: %p\n", popReturn);
         return popReturn;
     }
 }
@@ -57,8 +60,7 @@ int pushQueue(struct Queue* q, struct Thread* t) {
         return -1; // Error, queue full
     } else {
         q->arr[q->head] = t;
-        q->head++;
-        printf("q->arr[0]: %p\n", q->arr[0]);
+        q->head = (q->head + 1) % QUEUE_LEN;
     } 
     return 0;
 }
@@ -72,20 +74,18 @@ bool queueFull(struct Queue* q) {
 }
 
 
-
 void* createThread(int (*func)()) {
     struct Thread* new_thread = (struct Thread*)malloc(sizeof(struct Thread));
     new_thread->stack = malloc(0x10000); // give the frame ~64k of stack memory 
     new_thread->func = func;
     // new_thread->input = input; 
     // Stack can be initialized
-    ((uint64_t*)(new_thread->stack))[0] = 42;
+    //((uint64_t*)(new_thread->stack))[0] = 42;
     new_thread->in_progress = false;
     return new_thread;
 }
 
 void startThread(struct Thread* t) {
-    printf("starting thread\n");
     t->in_progress = true;
     asm volatile("pushq %%r10\n\t" // save caller regisers
                  "pushq %%r11\n\t"
@@ -107,19 +107,13 @@ void startThread(struct Thread* t) {
                  "popq %%r10\n\t"
                  :
                  :"r" (t->stack), "r" (t->func));
+    t->in_progress = false;
+    //Call context switcher
 }
 
 void alarm_handler(int signum) {
     struct Thread* next_thread;
     struct Thread* old_thread;
-
-    // store the return address, not sure that I need to do this, could just keep it at the bottom of the stack
-    /*
-    asm volatile ("popq %r10\n\t"
-                  "movq %r10, %rdi"
-                  :"=D" (running->ret_add));
-    */
-    
 
     // Push registers onto stack
     asm volatile ("pushq %rax\n\t"
@@ -135,13 +129,13 @@ void alarm_handler(int signum) {
                   "pushq %r15");
 
 
-    // Need to deal with the special cases of the stack and base pointers?  I think set and long jump deal with this.
-    /*
-    asm volatile ("movq %%rsp, (%0)\n\t"
-                  "movq %%rbp, (%1)\n\t"
-                  :"=r" (running->sp), "=r" (running->bp) 
-                 ); 
-    */
+    // reset alarm
+    printf("set next alarm\n");
+    memset(sa, 0, sizeof(sigaction)); 
+    sa->sa_handler = alarm_handler;
+    sa->sa_flags = SA_NODEFER;
+    sigaction(SIGALRM, sa, NULL);
+    alarm(1);
     
     // If the queue is empty, just jump out of the signal handler
     if(!queueEmpty(ready_q)) {
@@ -154,26 +148,20 @@ void alarm_handler(int signum) {
         pushQueue(ready_q, old_thread);
         running = next_thread;
 
-        // Save the environmnet variable
-        printf("before setjmp, signum: %d\n", signum);
-        if (!setjmp(old_thread->env)) {
-                
-            printf("after setjmp, signum: %d\n", signum);
-
-            // Return to context of next thread
-            if (next_thread->in_progress) {
-                printf("about to resume next thread");
-                longjmp(next_thread->env, 1);
-            // Or start up the thread if it hasn't begun executing
-            } else {
-                printf("about to start next thread");
+        // start up the thread if it hasn't begun executing
+        if (!running->in_progress) {
+            if (!setjmp(old_thread->env)) {
+                printf("about to start next thread\n");
                 startThread(next_thread); 
+            }
+        } else {
+            if (!setjmp(old_thread->env)) {
+                // Return to context of next thread
+                printf("about to resume next thread\n");
+                longjmp(next_thread->env, 1);
             }
         }
     }
-
-    // reset alarm
-    alarm(1);
 
     // restore registers from stack and return
     asm volatile ("popq %r15\n\t"
@@ -188,43 +176,62 @@ void alarm_handler(int signum) {
                   "popq %rbx\n\t"
                   "popq %rax\n\t"
                   );
-        
     return;
 }
 
 int main() {
+    // Set up signal handler and disable interrupt defer flag
+    sa = (struct sigaction*)malloc(sizeof(struct sigaction));
+    memset(sa, 0, sizeof(sigaction)); 
+    sa->sa_handler = alarm_handler;
+    sa->sa_flags = SA_NODEFER;
+    sigaction(SIGALRM, sa, NULL);
+
+    // Create and populate thread queue
     ready_q = createQueue();
     printf("made ready q\n");
     pushQueue(ready_q, createThread(pong));
+    pushQueue(ready_q, createThread(pop));
     printf("pushed pong thread onto ready q\n");
     printf("q->head = %d, q->tial = %d\n", ready_q->head, ready_q->tail);
     running = createThread(ping);
 
-    signal(SIGALRM, alarm_handler);
-    alarm(1);
     printf("Set the initial alarm\n");
+    alarm(1);
 
     startThread(running);
-
 
     return 0;
 }
 
-
-
 int ping() {
+    for (int i = 5; i > 0; i--) {
+        printf("starting ping in %d\n", i);
+        pause();
+    }
     for(;;) {
-        printf("ping\n");
+        printf("PING\n");
         pause();      
     }
+    return 0;
 }
 
 int pong() {
     for(;;) {
-        printf("pong\n");
+        printf("PONG\n");
         pause();      
     }
+    return 0;
 }
+
+int pop() {
+    for(;;) {
+        printf("POP\n");
+        pause();      
+    }
+    return 0;
+}
+
 
 int free_threads(struct Thread* head) {
     struct Thread* cur_t = head;
