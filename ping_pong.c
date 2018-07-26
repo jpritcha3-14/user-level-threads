@@ -14,6 +14,7 @@ struct sigaction* sa;
 int ping();
 int pong();
 int pop();
+void callScheduler();
 
 struct Thread {
     int (*func)();
@@ -32,6 +33,7 @@ struct Queue {
     struct Thread* arr[50];
 }; 
 struct Queue* ready_q;
+struct Queue* done_q;
 
 // queue initialization
 struct Queue* createQueue() {
@@ -97,7 +99,7 @@ void startThread(struct Thread* t) {
                  "lea (0x10000-0x8)(%0), %%rbp\n\t" // point rbp and rsp to the end of the frame
                  "lea (0x10000-0x8)(%0), %%rsp\n\t"
         
-                 "call *%1\n\t"  // call function (pushes return value onto top of stack)
+                 "call *%1\n\t"  // call function (pushes return address onto top of stack)
         
                  "movq %%r13, %%rsp\n\t" // restore original base and stack pointers
                  "movq %%r12, %%rbp\n\t"
@@ -108,10 +110,12 @@ void startThread(struct Thread* t) {
                  :
                  :"r" (t->stack), "r" (t->func));
     t->in_progress = false;
-    //Call context switcher
+    running = NULL;
+    callScheduler();
 }
 
-void alarm_handler(int signum) {
+
+void callScheduler() {
     struct Thread* next_thread;
     struct Thread* old_thread;
 
@@ -129,13 +133,6 @@ void alarm_handler(int signum) {
                   "pushq %r15");
 
 
-    // reset alarm
-    printf("set next alarm\n");
-    memset(sa, 0, sizeof(sigaction)); 
-    sa->sa_handler = alarm_handler;
-    sa->sa_flags = SA_NODEFER;
-    sigaction(SIGALRM, sa, NULL);
-    alarm(1);
     
     // If the queue is empty, just jump out of the signal handler
     if(!queueEmpty(ready_q)) {
@@ -145,20 +142,33 @@ void alarm_handler(int signum) {
         if (next_thread == NULL) {
             printf("error popping q\n"); 
         }
-        pushQueue(ready_q, old_thread);
+        if (old_thread != NULL) {
+            pushQueue(ready_q, old_thread);
+        } else {
+            pushQueue(done_q, old_thread);
+            printf("thread complete\n");
+        }
+        
         running = next_thread;
 
         // start up the thread if it hasn't begun executing
         if (!running->in_progress) {
-            if (!setjmp(old_thread->env)) {
-                printf("about to start next thread\n");
+            printf("about to start next thread\n");
+            if (old_thread == NULL) {
                 startThread(next_thread); 
+            } else {
+                if (!setjmp(old_thread->env)) {
+                    startThread(next_thread); 
+                }
             }
         } else {
-            if (!setjmp(old_thread->env)) {
-                // Return to context of next thread
-                printf("about to resume next thread\n");
+            printf("about to start next thread\n");
+            if (old_thread == NULL) {
                 longjmp(next_thread->env, 1);
+            } else {
+                if (!setjmp(old_thread->env)) {
+                    longjmp(next_thread->env, 1);
+                }
             }
         }
     }
@@ -179,6 +189,17 @@ void alarm_handler(int signum) {
     return;
 }
 
+void alarm_handler(int signum) {
+    // reset alarm
+    printf("set next alarm\n");
+    memset(sa, 0, sizeof(sigaction)); 
+    sa->sa_handler = alarm_handler;
+    sa->sa_flags = SA_NODEFER;
+    sigaction(SIGALRM, sa, NULL);
+    alarm(1);
+    callScheduler();
+}
+
 int main() {
     // Set up signal handler and disable interrupt defer flag
     sa = (struct sigaction*)malloc(sizeof(struct sigaction));
@@ -189,6 +210,7 @@ int main() {
 
     // Create and populate thread queue
     ready_q = createQueue();
+    done_q = createQueue();
     printf("made ready q\n");
     pushQueue(ready_q, createThread(pong));
     pushQueue(ready_q, createThread(pop));
@@ -205,14 +227,16 @@ int main() {
 }
 
 int ping() {
-    for (int i = 5; i > 0; i--) {
+    for (int i = 1; i > 0; i--) {
         printf("starting ping in %d\n", i);
         pause();
     }
+    /*
     for(;;) {
         printf("PING\n");
         pause();      
     }
+    */
     return 0;
 }
 
