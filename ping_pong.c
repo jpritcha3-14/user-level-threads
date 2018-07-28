@@ -1,4 +1,7 @@
-// Alarm handler should just reset the alarm and then call a seperate scheduler function.  This decouples the scheduler from the alarm
+/*
+ * TODO:
+ * Implement 'yield' function that places current thread onto waiting queue and calls the scheduler
+*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -6,8 +9,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <setjmp.h>
-
 #define QUEUE_LEN 50
+
 typedef enum {false, true} bool;
 struct sigaction* sa;
 
@@ -16,26 +19,31 @@ int pong();
 int pop();
 void callScheduler();
 
+// Thread has a pointer to a function to run, a stack to store local variables, and an environment to save its state
 struct Thread {
     int (*func)();
-    struct Thread* next;
-    int input;
-    jmp_buf env;
-    bool in_progress;
     void* stack;
+    jmp_buf env;
+    int input;
+    bool in_progress;
 };
 struct Thread* running;
 
-// entire structure for queuing system should be in heap memory so that all threads can access
+int freeThread(struct Thread* t) {
+    free(t->stack);
+    free(t);
+    return 0;
+}
+
+// Entire structure for queuing system should be in heap memory so that it can be accessed regardless of which thread calls the scheduler 
 struct Queue {
     int head;
     int tail;
     struct Thread* arr[50];
 }; 
 struct Queue* ready_q;
-struct Queue* done_q;
 
-// queue initialization
+// Queue initialization
 struct Queue* createQueue() {
     struct Queue* queue = (struct Queue*)malloc(sizeof(struct Queue));
     queue->head = 0;
@@ -43,16 +51,15 @@ struct Queue* createQueue() {
     return queue;
 }
 
-struct Thread* popReturn;
+// Queue manipulation functions: pop, push, empty, full
 struct Thread* popQueue(struct Queue* q) {
+    struct Thread* popReturn;
     if (q->head == q->tail) {
         printf("nothing to return\n");
         return NULL; // Error, no items in queue
     } else {
         popReturn = q->arr[q->tail];
         q->tail = (q->tail + 1) % QUEUE_LEN;
-        //printf("q->head = %d, q->tial = %d\n", q->head, q->tail);
-        //printf("popped thread @ address: %p\n", popReturn);
         return popReturn;
     }
 }
@@ -76,17 +83,17 @@ bool queueFull(struct Queue* q) {
 }
 
 
+// Allocate stack and bind function to new thread 
 void* createThread(int (*func)()) {
     struct Thread* new_thread = (struct Thread*)malloc(sizeof(struct Thread));
     new_thread->stack = malloc(0x10000); // give the frame ~64k of stack memory 
     new_thread->func = func;
     // new_thread->input = input; 
-    // Stack can be initialized
-    //((uint64_t*)(new_thread->stack))[0] = 42;
     new_thread->in_progress = false;
     return new_thread;
 }
 
+// Starts a threads function and points rbp and rsp bottom of stack, calls scheduler when thread returns
 void startThread(struct Thread* t) {
     t->in_progress = true;
     asm volatile("pushq %%r10\n\t" // save caller regisers
@@ -109,12 +116,14 @@ void startThread(struct Thread* t) {
                  "popq %%r10\n\t"
                  :
                  :"r" (t->stack), "r" (t->func));
-    t->in_progress = false;
+    freeThread(t);
+    printf("Thread dealocated\n");
     running = NULL;
     callScheduler();
 }
 
 
+// Implements a simple round robin scheduler: starting inactive threads, resuming active threads, and saving the state of the previous thread
 void callScheduler() {
     struct Thread* next_thread;
     struct Thread* old_thread;
@@ -131,24 +140,18 @@ void callScheduler() {
                   "pushq %r13\n\t"
                   "pushq %r14\n\t"
                   "pushq %r15");
-
-
     
     // If the queue is empty, just jump out of the signal handler
     if(!queueEmpty(ready_q)) {
         old_thread = running; 
-        printf("q->head = %d, q->tial = %d\n", ready_q->head, ready_q->tail);
+        //printf("q->head = %d, q->tial = %d\n", ready_q->head, ready_q->tail);
         next_thread = popQueue(ready_q); 
         if (next_thread == NULL) {
             printf("error popping q\n"); 
         }
         if (old_thread != NULL) {
             pushQueue(ready_q, old_thread);
-        } else {
-            pushQueue(done_q, old_thread);
-            printf("thread complete\n");
         }
-        
         running = next_thread;
 
         // start up the thread if it hasn't begun executing
@@ -162,7 +165,7 @@ void callScheduler() {
                 }
             }
         } else {
-            printf("about to start next thread\n");
+            printf("about to reusme next thread\n");
             if (old_thread == NULL) {
                 longjmp(next_thread->env, 1);
             } else {
@@ -171,9 +174,11 @@ void callScheduler() {
                 }
             }
         }
+    } else {
+        ; //TBI, run null job 
     }
 
-    // restore registers from stack and return
+    // Restore registers from stack and return
     asm volatile ("popq %r15\n\t"
                   "popq %r14\n\t"
                   "popq %r13\n\t"
@@ -189,8 +194,8 @@ void callScheduler() {
     return;
 }
 
+// Reset alarm and call scheduler
 void alarm_handler(int signum) {
-    // reset alarm
     printf("set next alarm\n");
     memset(sa, 0, sizeof(sigaction)); 
     sa->sa_handler = alarm_handler;
@@ -210,33 +215,25 @@ int main() {
 
     // Create and populate thread queue
     ready_q = createQueue();
-    done_q = createQueue();
     printf("made ready q\n");
+    pushQueue(ready_q, createThread(ping));
     pushQueue(ready_q, createThread(pong));
     pushQueue(ready_q, createThread(pop));
-    printf("pushed pong thread onto ready q\n");
-    printf("q->head = %d, q->tial = %d\n", ready_q->head, ready_q->tail);
-    running = createThread(ping);
 
     printf("Set the initial alarm\n");
     alarm(1);
 
-    startThread(running);
+    running = NULL;
+    callScheduler();
 
     return 0;
 }
 
 int ping() {
-    for (int i = 1; i > 0; i--) {
-        printf("starting ping in %d\n", i);
+    for (int i = 3; i > 0; i--) {
+        printf("PING %d more times\n", i-1);
         pause();
     }
-    /*
-    for(;;) {
-        printf("PING\n");
-        pause();      
-    }
-    */
     return 0;
 }
 
@@ -254,17 +251,4 @@ int pop() {
         pause();      
     }
     return 0;
-}
-
-
-int free_threads(struct Thread* head) {
-    struct Thread* cur_t = head;
-    struct Thread* next_t = head;
-    while (cur_t != NULL) {
-        free(cur_t->stack);
-        next_t = cur_t->next;
-        free(cur_t);
-        cur_t = next_t;
-    }
-    return 1;
 }
